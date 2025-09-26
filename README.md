@@ -26,6 +26,7 @@ Features:
 
 Installation
 git clone https://github.com/pvf13-net/CveHunter.git
+
 cd CveHunter
 
 python -m venv .venv
