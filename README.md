@@ -25,8 +25,8 @@ Features:
 6. No API keys required
 
 Installation
-git clone https://github.com/<your-username>/<your-repo>.git
-cd <your-repo>
+git clone https://github.com/pvf13-net/CveHunter.git
+cd CveHunter
 
 python -m venv .venv
 # Linux/macOS
