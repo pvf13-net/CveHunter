@@ -20,7 +20,7 @@ console = Console()
 def make_session(timeout: int, retries: int = 3, backoff: float = 0.5) -> requests.Session:
     s = requests.Session()
     s.headers.update({
-        "User-Agent": "CVE-Spider/1.2 (+https://example.local)",
+        "User-Agent": "CVE-Hunting/1.2 (+https://example.local)",
         "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
     })
     retry = Retry(
@@ -47,7 +47,7 @@ def _with_timeout(request_func, timeout):
 
 
 def banner(to_file=None):
-    banner_text = "[bold green]CVE Spidering Tool[/bold green]\n" \
+    banner_text = "[bold green]CVE Hunting Tool[/bold green]\n" \
                   "[bold yellow]Author:[/bold yellow] pvf13-net\n" \
                   "[bold cyan]Hunting CVEs[/bold cyan]"
     panel = Panel.fit(
@@ -57,7 +57,7 @@ def banner(to_file=None):
     )
     if to_file:
         # Write a plain-text banner for files
-        to_file.write("=== CVE Spidering Tool ===\nAuthor: pvf13-net\nHunting CVEs\n\n")
+        to_file.write("=== CVE Hunting Tool ===\nAuthor: pvf13-net\nHunting CVEs\n\n")
     else:
         console.print(panel)
 
