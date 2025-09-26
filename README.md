@@ -46,21 +46,21 @@ beautifulsoup4
 
 Usage
 # Scan a domain (auto-resolve)
-python cve_spider.py -d example.org
+python CveHunter.py -d example.org
 
 # Scan an IP
-python cve_spider.py -d 1.2.3.4
+python CveHunter.py -d 1.2.3.4
 
 # Save results to file (plain text)
-python cve_spider.py -d example.org -o results.txt
+python CveHunter.py -d example.org -o results.txt
 
 # Tune performance / network behavior
-python cve_spider.py -d example.org --threads 16 --timeout 20
+python CveHunter.py -d example.org --threads 16 --timeout 20
 
 
 CLI
 
-usage: cve_spider.py [-h] [-d DOMAIN] [-o OUTPUT] [--threads THREADS] [--timeout TIMEOUT]
+usage: CveHunter.py [-h] [-d DOMAIN] [-o OUTPUT] [--threads THREADS] [--timeout TIMEOUT]
 
 
 -d / --domain : IP or domain
