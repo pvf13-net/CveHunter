@@ -1,2 +1,2 @@
-# CveSpider
+# CveHunter
 Cves Hunting Tool
