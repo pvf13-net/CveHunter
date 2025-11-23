@@ -1,14 +1,9 @@
-import argparse
-import ipaddress
-import socket
-import sys
-import re
+#!/usr/bin/env python3
+import argparse, ipaddress, socket, sys, re, subprocess, json
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -16,238 +11,182 @@ from bs4 import BeautifulSoup
 
 console = Console()
 
-
-def make_session(timeout: int, retries: int = 3, backoff: float = 0.5) -> requests.Session:
+# ---------- HTTP session ----------
+def make_session(timeout: int = 10):
     s = requests.Session()
-    s.headers.update({
-        "User-Agent": "CVE-Hunting/1.2 (+https://example.local)",
-        "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
-    })
-    retry = Retry(
-        total=retries,
-        read=retries,
-        connect=retries,
-        backoff_factor=backoff,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=frozenset(["GET", "HEAD"]),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
-    s.request = _with_timeout(s.request, timeout)  # inject default timeout
+    s.headers.update({"User-Agent": "CVE-Hunting/1.2 (+local)"})
+    retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+    s.mount("http://", HTTPAdapter(max_retries=retry))
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.request = _with_timeout(s.request, timeout)
     return s
 
-def _with_timeout(request_func, timeout):
-    def wrapped(method, url, **kwargs):
-        if "timeout" not in kwargs:
-            kwargs["timeout"] = timeout
-        return request_func(method, url, **kwargs)
+def _with_timeout(req, timeout):
+    def wrapped(method, url, **kw):
+        kw.setdefault("timeout", timeout)
+        return req(method, url, **kw)
     return wrapped
 
+# ---------- UI ----------
+def banner():
+    console.print(Panel.fit(
+        "[bold green]CVE Hunting Tool[/]\n[bold yellow]Author:[/] pvf13-net\n[bold cyan]Hunting CVEs[/]",
+        title="[bold blue]Welcome[/]", border_style="bold magenta"
+    ))
 
-def banner(to_file=None):
-    banner_text = "[bold green]CVE Hunting Tool[/bold green]\n" \
-                  "[bold yellow]Author:[/bold yellow] pvf13-net\n" \
-                  "[bold cyan]Hunting CVEs[/bold cyan]"
-    panel = Panel.fit(
-        banner_text,
-        title="[bold blue]Welcome[/bold blue]",
-        border_style="bold magenta"
-    )
-    if to_file:
-        # Write a plain-text banner for files
-        to_file.write("=== CVE Hunting Tool ===\nAuthor: pvf13-net\nHunting CVEs\n\n")
-    else:
-        console.print(panel)
-
-
-def is_ip(value: str) -> bool:
+# ---------- helpers ----------
+def is_ip(v):
     try:
-        ipaddress.ip_address(value)
-        return True
+        ipaddress.ip_address(v); return True
     except ValueError:
         return False
 
 def resolve_domain(domain: str) -> str:
     try:
         return socket.gethostbyname(domain)
-    except socket.gaierror:
-        console.print(f"[bold red][!] Unable to resolve domain: {domain}[/bold red]")
+    except Exception:
+        console.print(f"[bold red][!] Cannot resolve {domain}[/]")
         sys.exit(1)
 
+# ---------- nmap run & parse ----------
+VULNERS_PATH = "/usr/share/nmap/scripts/vulners.nse"
 
-def fetch_internetdb(ip: str, session: requests.Session) -> dict:
-    url = f"https://internetdb.shodan.io/{ip}"
+def _run_nmap(ip: str, fast: bool = True) -> str:
+    # Container-safe flags: -Pn (no ping), -sT (TCP connect), -n (no DNS), --reason for clarity
+    cmd = [
+        "nmap", "-sV", "-sT", "-Pn", "-n", "--reason",
+        "--script", VULNERS_PATH, "--script-args", "mincvss=0.0",
+        "-oN", "-", ip
+    ]
+    if fast:
+        cmd.insert(1, "-F")  # top 100 ports first
     try:
-        r = session.get(url)
-        if r.status_code == 200:
-            return r.json()
-        console.print(f"[bold red][!] Error fetching InternetDB data: HTTP {r.status_code}[/bold red]")
-        sys.exit(1)
-    except requests.RequestException as e:
-        console.print(f"[bold red][!] Request failed: {e}[/bold red]")
-        sys.exit(1)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        return res.stdout
+    except Exception as e:
+        console.print(f"[red][!] nmap failed: {e}[/]")
+        return ""
 
+_port_re = re.compile(r"^(\d{1,5})/tcp\s+open\b", re.MULTILINE)
+_cve_re  = re.compile(r"(CVE-\d{4}-\d{4,})", re.IGNORECASE)
+_hn_re   = re.compile(r"^Nmap scan report for (.+)$", re.MULTILINE)
 
-_CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
+def _parse_nmap(out: str, ip: str):
+    ports = [int(m.group(1)) for m in _port_re.finditer(out)]
+    cves  = sorted(set(_cve_re.findall(out)), key=lambda x: (int(x.split("-")[1]), int(x.split("-")[2])))
+    hn = []
+    m = _hn_re.search(out)
+    if m:
+        name = m.group(1)
+        hn = [name.split(" (")[0]]
+    if not hn:
+        hn = [ip]
+    return {"ports": ports, "vulns": cves, "hostnames": hn}
 
+def scan_target(ip: str) -> dict:
+    console.print(f"[bold cyan][+] Scanning {ip} with nmap + vulners.com (2025 method)...[/]")
+    out = _run_nmap(ip, fast=True)
+    data = _parse_nmap(out, ip)
+    if not data["ports"]:
+        out2 = _run_nmap(ip, fast=False)
+        d2 = _parse_nmap(out2, ip)
+        data["ports"] = sorted(set(data["ports"] + d2["ports"]))
+        data["vulns"] = sorted(set(data["vulns"] + d2["vulns"]),
+                               key=lambda x: (int(x.split("-")[1]), int(x.split("-")[2])))
+        if d2["hostnames"] and d2["hostnames"] != [ip]:
+            data["hostnames"] = d2["hostnames"]
+    return data
+
+# ---------- NVD score (robust) ----------
 def get_base_score(cve_id: str, session: requests.Session):
     """
-    Returns (score_text, url) for a CVE.
-    Attempts multiple selectors to be resilient to minor NVD changes.
+    Returns (score_text, url). Tries NVD 2.0 JSON first, then HTML as fallback.
     """
-    url = f"https://nvd.nist.gov/vuln/detail/{cve_id}"
+    nvd_link = f"https://nvd.nist.gov/vuln/detail/{cve_id}"
+
+    # 1) JSON API (stable, no scraping)
     try:
-        r = session.get(url)
-        if r.status_code != 200:
-            return f"HTTP {r.status_code}", url
+        jurl = f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve_id}"
+        r = session.get(jurl)
+        if r.status_code == 200:
+            j = r.json()
+            vulns = j.get("vulnerabilities") or []
+            if vulns:
+                metrics = (vulns[0].get("cve") or {}).get("metrics") or {}
+                for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+                    if key in metrics and metrics[key]:
+                        metric = metrics[key][0]
+                        cvss   = metric.get("cvssData", {})
+                        base   = cvss.get("baseScore") or metric.get("baseScore")
+                        sev    = cvss.get("baseSeverity") or metric.get("baseSeverity", "")
+                        vec    = cvss.get("vectorString", "")
+                        score_text = f"{base} {sev}".strip() if base else "N/A"
+                        return score_text, nvd_link
+    except Exception:
+        pass
 
-        soup = BeautifulSoup(r.text, "html.parser")
+    # 2) HTML fallback (best-effort)
+    try:
+        r = session.get(nvd_link)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, "html.parser")
+            el = soup.find("a", {"data-testid": "vuln-cvss3-panel-score"})
+            if el and el.text.strip():
+                return el.text.strip(), nvd_link
+    except Exception:
+        pass
 
-        # Primary selector (current NVD)
-        el = soup.find("a", {"data-testid": "vuln-cvss3-panel-score"})
-        if el and el.text.strip():
-            return el.text.strip(), url
+    return "N/A", nvd_link
 
-        # Secondary attempts (legacy/fallbacks)
-        alt = soup.select_one("#Cvss3NistCalculatorAnchor, .severityDetail a, .label-and-score > a")
-        if alt and alt.text.strip():
-            return alt.text.strip(), url
+# ---------- display ----------
+def display_hostnames(hostnames):
+    table = Table(title="Hostnames"); table.add_column("Hostname", style="cyan")
+    for h in (hostnames or ["N/A"]): table.add_row(h)
+    console.print(table)
 
-        # Sometimes score is in a span near 'CVSS 3.x Base Score'
-        for possible in soup.find_all(["span", "a"]):
-            txt = (possible.get_text(strip=True) or "")
-            if re.match(r"^(CVSS.*Base Score|[0-9]+\.[0-9]+)$", txt):
-                return txt, url
-
-        return "Not Found", url
-    except Exception as e:
-        return f"Error: {str(e)}", url
-
-
-def display_hostnames(hostnames, to_file=None):
-    hostnames = sorted(set(hostnames or []))
-    if to_file:
-        to_file.write("\nHostnames:\n")
-        if hostnames:
-            for h in hostnames:
-                to_file.write(f" -> {h}\n")
-        else:
-            to_file.write("N/A\n")
+def display_ports(ports):
+    table = Table(title="Open Ports"); table.add_column("Port", justify="right", style="green")
+    if not ports: table.add_row("N/A")
     else:
-        table = Table(title="Hostnames")
-        table.add_column("Hostname", style="cyan")
-        if hostnames:
-            for h in hostnames:
-                table.add_row(h)
-        else:
-            table.add_row("N/A")
-        console.print(table)
+        for p in sorted(ports): table.add_row(str(p))
+    console.print(table)
 
-def display_ports(ports, to_file=None):
-    ports = sorted(set(ports or []))
-    if to_file:
-        to_file.write("\nOpen Ports:\n")
-        if ports:
-            for p in ports:
-                to_file.write(f" -> {p}\n")
-        else:
-            to_file.write("N/A\n")
-    else:
-        table = Table(title="Open Ports")
-        table.add_column("Port", justify="right", style="green")
-        if ports:
-            for p in ports:
-                table.add_row(str(p))
-        else:
-            table.add_row("N/A")
-        console.print(table)
-
-def display_cves(cves, session: requests.Session, threads: int, to_file=None):
-    cves = [c for c in (cves or []) if _CVE_RE.match(c)]
-    cves = sorted(set(cves), key=lambda s: (s.split("-")[1], int(s.split("-")[2])))
-
-    if to_file:
-        to_file.write("\nVulnerabilities (CVEs):\n\n")
-        if not cves:
-            to_file.write("N/A\n")
-            return
-    else:
-        table = Table(title="Vulnerabilities (CVEs)")
-        table.add_column("CVE", style="bold")
-        table.add_column("Base Score", justify="center")
-        table.add_column("Link", style="blue", overflow="fold")
-
+def display_cves(cves, session: requests.Session):
     if not cves:
-        if not to_file:
-            console.print("[yellow]No CVEs found.[/yellow]")
+        console.print("[yellow]No CVEs found.[/]")
         return
-
-    max_workers = min(len(cves), max(1, threads))
-    futures = []
+    table = Table(title="Vulnerabilities (CVEs)")
+    table.add_column("CVE", style="bold red")
+    table.add_column("Score", justify="center")
+    table.add_column("Link", style="blue")
+    # Be gentle with NVD rate limits
+    max_workers = min(5, len(cves))
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        for cve in cves:
-            futures.append(ex.submit(get_base_score, cve, session))
+        futures = {ex.submit(get_base_score, c, session): c for c in cves}
+        for fut in as_completed(futures):
+            c = futures[fut]; score, url = fut.result()
+            table.add_row(c, score, f"[link={url}]{url}[/]")
+    console.print(table)
 
-        for cve, fut in zip(cves, as_completed(futures)):
-            score, url = fut.result()
-            if to_file:
-                to_file.write(f" -> | {cve}\t| {score}\t| {url}\t|\n")
-            else:
-                table.add_row(cve, str(score), f"[link={url}]{url}[/link]")
-
-    if not to_file:
-        console.print(table)
-
-
+# ---------- main ----------
 def main():
     parser = argparse.ArgumentParser(description="CVEs Hunting Tool (improved)")
     parser.add_argument("-d", "--domain", help="IP address or domain to scan")
-    parser.add_argument("-o", "--output", help="Write human-readable results to a text file", type=str)
-    parser.add_argument("--threads", help="Max concurrent CVE lookups (default: 8)", type=int, default=8)
-    parser.add_argument("--timeout", help="HTTP timeout seconds (default: 10)", type=int, default=10)
     args = parser.parse_args()
 
-    out_fh = open(args.output, "w", encoding="utf-8") if args.output else None
-    try:
-        banner(out_fh)
+    banner()
+    target = args.domain or sys.stdin.read().strip()
+    if not target:
+        console.print("[bold red][!] No target given[/]"); return
 
-        # Determine target (arg or piped)
-        if not args.domain:
-            piped = sys.stdin.read().strip()
-            if not piped:
-                console.print("[bold red][!] No input provided via pipe or -d/--domain.[/bold red]")
-                sys.exit(1)
-            target = piped
-        else:
-            target = args.domain.strip()
+    ip = target if is_ip(target) else resolve_domain(target)
+    console.print(f"[bold green][+] Target IP: {ip}[/]")
 
-        # Resolve if domain
-        if not is_ip(target):
-            console.print(f"[bold yellow][+] Resolving domain {target} to IP...[/bold yellow]") if not out_fh else None
-            ip = resolve_domain(target)
-            if out_fh:
-                out_fh.write(f"Resolved {target} -> {ip}\n")
-            else:
-                console.print(f"[bold green][+] Resolved IP: {ip}[/bold green]")
-        else:
-            ip = target
-
-        # HTTP session with retry/timeout
-        session = make_session(timeout=args.timeout)
-
-        if not out_fh:
-            console.print(f"[bold cyan][+] Fetching data for IP: {ip}...[/bold cyan]")
-        data = fetch_internetdb(ip, session)
-
-        display_hostnames(data.get("hostnames", []), out_fh)
-        display_ports(data.get("ports", []), out_fh)
-        display_cves(data.get("vulns", []), session=session, threads=args.threads, to_file=out_fh)
-
-    finally:
-        if out_fh:
-            out_fh.close()
+    data = scan_target(ip)
+    session = make_session(timeout=10)
+    display_hostnames(data["hostnames"])
+    display_ports(data["ports"])
+    display_cves(data["vulns"], session)
 
 if __name__ == "__main__":
     main()
