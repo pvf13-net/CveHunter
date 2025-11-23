@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, ipaddress, socket, sys, re, subprocess, json
+import argparse, ipaddress, socket, sys, re, subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from requests.adapters import HTTPAdapter
@@ -52,14 +52,14 @@ def resolve_domain(domain: str) -> str:
 VULNERS_PATH = "/usr/share/nmap/scripts/vulners.nse"
 
 def _run_nmap(ip: str, fast: bool = True) -> str:
-    # Container-safe flags: -Pn (no ping), -sT (TCP connect), -n (no DNS), --reason for clarity
+    # container-safe: -Pn (no ping), -sT (connect scan), -n (no DNS), --reason
     cmd = [
         "nmap", "-sV", "-sT", "-Pn", "-n", "--reason",
         "--script", VULNERS_PATH, "--script-args", "mincvss=0.0",
         "-oN", "-", ip
     ]
     if fast:
-        cmd.insert(1, "-F")  # top 100 ports first
+        cmd.insert(1, "-F")
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         return res.stdout
@@ -97,14 +97,9 @@ def scan_target(ip: str) -> dict:
             data["hostnames"] = d2["hostnames"]
     return data
 
-# ---------- NVD score (robust) ----------
+# ---------- NVD score (JSON API with fallback) ----------
 def get_base_score(cve_id: str, session: requests.Session):
-    """
-    Returns (score_text, url). Tries NVD 2.0 JSON first, then HTML as fallback.
-    """
     nvd_link = f"https://nvd.nist.gov/vuln/detail/{cve_id}"
-
-    # 1) JSON API (stable, no scraping)
     try:
         jurl = f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve_id}"
         r = session.get(jurl)
@@ -119,13 +114,10 @@ def get_base_score(cve_id: str, session: requests.Session):
                         cvss   = metric.get("cvssData", {})
                         base   = cvss.get("baseScore") or metric.get("baseScore")
                         sev    = cvss.get("baseSeverity") or metric.get("baseSeverity", "")
-                        vec    = cvss.get("vectorString", "")
                         score_text = f"{base} {sev}".strip() if base else "N/A"
                         return score_text, nvd_link
     except Exception:
         pass
-
-    # 2) HTML fallback (best-effort)
     try:
         r = session.get(nvd_link)
         if r.status_code == 200:
@@ -135,7 +127,6 @@ def get_base_score(cve_id: str, session: requests.Session):
                 return el.text.strip(), nvd_link
     except Exception:
         pass
-
     return "N/A", nvd_link
 
 # ---------- display ----------
@@ -151,27 +142,32 @@ def display_ports(ports):
         for p in sorted(ports): table.add_row(str(p))
     console.print(table)
 
-def display_cves(cves, session: requests.Session):
+def display_cves(cves, session: requests.Session, threads: int):
+    rows = []
     if not cves:
         console.print("[yellow]No CVEs found.[/]")
-        return
+        return rows
     table = Table(title="Vulnerabilities (CVEs)")
     table.add_column("CVE", style="bold red")
     table.add_column("Score", justify="center")
     table.add_column("Link", style="blue")
-    # Be gentle with NVD rate limits
-    max_workers = min(5, len(cves))
+    max_workers = max(1, min(threads, 8, len(cves)))  # be kind to NVD
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {ex.submit(get_base_score, c, session): c for c in cves}
         for fut in as_completed(futures):
             c = futures[fut]; score, url = fut.result()
             table.add_row(c, score, f"[link={url}]{url}[/]")
+            rows.append((c, score, url))
     console.print(table)
+    return rows
 
 # ---------- main ----------
 def main():
     parser = argparse.ArgumentParser(description="CVEs Hunting Tool (improved)")
     parser.add_argument("-d", "--domain", help="IP address or domain to scan")
+    parser.add_argument("-o", "--output", help="Write human-readable report to a text file")
+    parser.add_argument("--threads", type=int, default=5, help="Max concurrent NVD lookups (default: 5)")
+    parser.add_argument("--timeout", type=int, default=10, help="HTTP timeout seconds for NVD (default: 10)")
     args = parser.parse_args()
 
     banner()
@@ -183,10 +179,30 @@ def main():
     console.print(f"[bold green][+] Target IP: {ip}[/]")
 
     data = scan_target(ip)
-    session = make_session(timeout=10)
+    session = make_session(timeout=args.timeout)
+
     display_hostnames(data["hostnames"])
     display_ports(data["ports"])
-    display_cves(data["vulns"], session)
+    rows = display_cves(data["vulns"], session, threads=args.threads)
+
+    # Optional file output
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write("=== CVE Hunting Tool ===\n")
+            f.write(f"Target IP: {ip}\n\n")
+            f.write("Hostnames:\n")
+            for h in data["hostnames"]: f.write(f"  - {h}\n")
+            f.write("\nOpen Ports:\n")
+            if data["ports"]:
+                for p in sorted(data["ports"]): f.write(f"  - {p}\n")
+            else:
+                f.write("  N/A\n")
+            f.write("\nVulnerabilities (CVEs):\n")
+            if rows:
+                for cve, score, url in sorted(rows):
+                    f.write(f"  - {cve}\t{score}\t{url}\n")
+            else:
+                f.write("  N/A\n")
 
 if __name__ == "__main__":
     main()
